@@ -3,11 +3,11 @@ plugins {
 }
 
 android {
-    namespace = "com.example.sensoralarmapplication"
+    namespace = "com.moutamid.sensoralarmapplication"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.example.sensoralarmapplication"
+        applicationId = "com.moutamid.sensoralarmapplication"
         minSdk = 24
         targetSdk = 35
         versionCode = 1

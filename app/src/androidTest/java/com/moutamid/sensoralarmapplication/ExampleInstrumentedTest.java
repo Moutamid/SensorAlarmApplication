@@ -1,4 +1,4 @@
-package com.example.sensoralarmapplication;
+package com.moutamid.sensoralarmapplication;
 
 import android.content.Context;
 
