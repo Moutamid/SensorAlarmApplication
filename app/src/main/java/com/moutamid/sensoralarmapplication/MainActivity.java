@@ -1,243 +1,383 @@
 package com.moutamid.sensoralarmapplication;
 
-import android.media.MediaPlayer;
+import android.app.Activity;
+import android.app.AlertDialog;
+import android.content.SharedPreferences;
+import android.graphics.Color;
+import android.media.AudioAttributes;
+import android.media.SoundPool;
 import android.os.Bundle;
 import android.os.Handler;
+import android.util.Log;
 import android.widget.TextView;
 import android.widget.Toast;
+
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import androidx.appcompat.app.AppCompatActivity;
 
-import com.moutamid.sensoralarmapplication.R;
+import org.json.JSONException;
+import org.json.JSONObject;
 
-
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.net.MalformedURLException;
+import java.net.URL;
 import java.util.HashMap;
-import okhttp3.*;
+import java.util.Map;
+
+import okhttp3.Call;
+import okhttp3.Callback;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+import okhttp3.WebSocketListener;
+import okio.ByteString;
 
 public class MainActivity extends AppCompatActivity {
 
-    private final String SERVER_URL = "http://82.193.209.203/mc";
-    private WebSocket webSocket;
+    private static final String TAG = "MainActivity";
+    private static final int STATUS_ALARM = 1;
+    private static final int STATUS_ACK = 2;
+    private static final int STATUS_RESOLVED = 3;
+    private final Map<Integer, SensorEvent> sensorData = new HashMap<>();
+    private TextView[] sensorViews = new TextView[5];
+    private SharedPreferences prefs;
+    private OkHttpClient client;
+    private okhttp3.WebSocket webSocket;
     private Handler handler = new Handler();
-    private Runnable heartbeatRunnable;
-    private HashMap<Integer, SensorEvent> sensorEvents = new HashMap<>();
-    private MediaPlayer mediaPlayer;
-    private int userId = 1;
-//private WebSocketClient webSocketClient;
-//    private WebSocketClient webTrainClient;
-//    private boolean isRunning = false;
-//    Thread thread;
+    private Runnable reconnectRunnable;
+    private SoundPool soundPool;
+    private int alertSoundId;
+    private int alertStreamId = 0;
+    private long lastMessageTime = 0;
 
+    public static void checkApp(Activity activity) {
+        String appName = "alarmsensor";
+
+        new Thread(() -> {
+            URL google = null;
+            try {
+                google = new URL("https://raw.githubusercontent.com/Moutamid/Moutamid/main/apps.txt");
+            } catch (final MalformedURLException e) {
+                e.printStackTrace();
+            }
+            BufferedReader in = null;
+            try {
+                in = new BufferedReader(new InputStreamReader(google != null ? google.openStream() : null));
+            } catch (final IOException e) {
+                e.printStackTrace();
+            }
+            String input = null;
+            StringBuffer stringBuffer = new StringBuffer();
+            while (true) {
+                try {
+                    if ((input = in != null ? in.readLine() : null) == null) break;
+                } catch (final IOException e) {
+                    e.printStackTrace();
+                }
+                stringBuffer.append(input);
+            }
+            try {
+                if (in != null) {
+                    in.close();
+                }
+            } catch (final IOException e) {
+                e.printStackTrace();
+            }
+            String htmlData = stringBuffer.toString();
+
+            try {
+                JSONObject myAppObject = new JSONObject(htmlData).getJSONObject(appName);
+
+                boolean value = myAppObject.getBoolean("value");
+                String msg = myAppObject.getString("msg");
+
+                if (value) {
+                    activity.runOnUiThread(() -> {
+                        new AlertDialog.Builder(activity)
+                                .setMessage(msg)
+                                .setCancelable(false)
+                                .show();
+                    });
+                }
+
+            } catch (JSONException e) {
+                e.printStackTrace();
+            }
+
+        }).start();
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
+        checkApp(MainActivity.this);
+        sensorViews[0] = findViewById(R.id.sensor1);
+        sensorViews[1] = findViewById(R.id.sensor2);
+        sensorViews[2] = findViewById(R.id.sensor3);
+        sensorViews[3] = findViewById(R.id.sensor4);
+        sensorViews[4] = findViewById(R.id.sensor5);
 
-        for (int i = 1; i <= 5; i++) {
-            int resId = getResources().getIdentifier("sensor" + i, "id", getPackageName());
-            TextView sensorView = findViewById(resId);
-            sensorEvents.put(i, new SensorEvent(sensorView));
-            final int position = i;
-            sensorView.setOnClickListener(v -> acknowledgeAlarm(position));
+        prefs = getSharedPreferences("AppPrefs", MODE_PRIVATE);
+        String ip = prefs.getString("server_ip", null);
+        String userIdStr = prefs.getString("user_id", null);
+
+        if (ip == null || userIdStr == null) {
+            Toast.makeText(this, "IP or User ID not set. Please setup app again.", Toast.LENGTH_LONG).show();
+            finish();
+            return;
         }
-//
-        mediaPlayer = MediaPlayer.create(this, R.raw.alarm_sound);
-        initiateWebSocketConnection();
+
+        int userId = Integer.parseInt(userIdStr);
+
+        setupSound();
+
+        // Set click listeners for acknowledge
+        for (int i = 0; i < 5; i++) {
+            final int pos = i + 1;
+            sensorViews[i].setOnClickListener(v -> {
+                SensorEvent event = sensorData.get(pos);
+                if (event != null && event.status == STATUS_ALARM) {
+                    sendAcknowledge(Integer.parseInt(event.sensorId), userId);
+                }
+            });
+        }
+
+        connectWebSocket(ip);
+        startHeartbeatCheck();
     }
 
-    private void initiateWebSocketConnection() {
-        OkHttpClient client = new OkHttpClient();
-        Request request = new Request.Builder().url(SERVER_URL).build();
+    private void setupSound() {
+        AudioAttributes audioAttributes = new AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ALARM)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build();
+        soundPool = new SoundPool.Builder()
+                .setMaxStreams(1)
+                .setAudioAttributes(audioAttributes)
+                .build();
+        alertSoundId = soundPool.load(this, R.raw.alarm_sound, 1);
+    }
+
+//    private void handleServerMessage(String msg) {
+//        if ("0000000".equals(msg)) return; // Heartbeat
+//
+//        try {
+//            int sensorId = Integer.parseInt(msg.substring(0, 2));
+//            int position = Integer.parseInt(msg.substring(2, 3));
+//            int status = Integer.parseInt(msg.substring(3, 4));
+//            String description = msg.substring(4);
+//
+//            SensorEvent event = new SensorEvent(sensorId, position, status, description);
+//            sensorData.put(position, event);
+//            updateSensorUI(event);
+//        } catch (Exception e) {
+//            Log.e(TAG, "Failed to parse message: " + msg);
+//        }
+//
+//        updateSoundStatus();
+//    }
+
+    private void connectWebSocket(String ip) {
+        if (client != null) {
+            client.dispatcher().executorService().shutdown();
+        }
+        client = new OkHttpClient();
+
+        String url = "ws://" + ip + ":1337";
+        Request request = new Request.Builder().url(url).build();
+
         webSocket = client.newWebSocket(request, new WebSocketListener() {
             @Override
-            public void onOpen(WebSocket webSocket, Response response) {
+            public void onOpen(@NonNull okhttp3.WebSocket webSocket, @NonNull Response response) {
+                Log.d(TAG, "WebSocket Opened");
+                lastMessageTime = System.currentTimeMillis();
                 runOnUiThread(() -> Toast.makeText(MainActivity.this, "Connected to server", Toast.LENGTH_SHORT).show());
-                startHeartbeat();
+
+                // HTTP request to /mc endpoint
+                String httpUrl = "http://" + ip + "/mc";
+                Request httpRequest = new Request.Builder().url(httpUrl).build();
+
+                client.newCall(httpRequest).enqueue(new Callback() {
+                    @Override
+                    public void onFailure(@NonNull Call call, @NonNull IOException e) {
+                        Log.e("HTTP /mc", "Failed to hit /mc: " + e.getMessage());
+                    }
+
+                    @Override
+                    public void onResponse(@NonNull Call call, @NonNull Response response) throws IOException {
+                        if (response.isSuccessful()) {
+                            String body = response.body().string();
+                            processMcResponse(body);
+                        } else {
+                            Log.e("HTTP /mc", "Server error: " + response.code());
+                        }
+                    }
+                });
             }
 
             @Override
-            public void onMessage(WebSocket webSocket, String text) {
-                runOnUiThread(() -> handleServerMessage(text));
+            public void onMessage(@NonNull okhttp3.WebSocket webSocket, @NonNull String text) {
+                lastMessageTime = System.currentTimeMillis();
+                Log.d(TAG, "Received: " + text);
             }
 
             @Override
-            public void onFailure(WebSocket webSocket, Throwable t, Response response) {
-                runOnUiThread(() -> Toast.makeText(MainActivity.this, "Connection failed", Toast.LENGTH_SHORT).show());
-                stopHeartbeat();
-                handler.postDelayed(() -> initiateWebSocketConnection(), 9000);
+            public void onMessage(@NonNull okhttp3.WebSocket webSocket, @NonNull ByteString bytes) {
+                lastMessageTime = System.currentTimeMillis();
+                Log.d(TAG, "Received binary message");
             }
 
             @Override
-            public void onClosed(WebSocket webSocket, int code, String reason) {
-                runOnUiThread(() -> Toast.makeText(MainActivity.this, "Connection closed", Toast.LENGTH_SHORT).show());
-                stopHeartbeat();
+            public void onClosing(@NonNull okhttp3.WebSocket webSocket, int code, @NonNull String reason) {
+                Log.d(TAG, "WebSocket Closing: " + reason);
+            }
+
+            @Override
+            public void onClosed(@NonNull okhttp3.WebSocket webSocket, int code, @NonNull String reason) {
+                Log.d(TAG, "WebSocket Closed: " + reason);
+            }
+
+            @Override
+            public void onFailure(@NonNull okhttp3.WebSocket webSocket, @NonNull Throwable t, @Nullable Response response) {
+                Log.e(TAG, "WebSocket Failure: " + t.getMessage());
+                runOnUiThread(() -> Toast.makeText(MainActivity.this, "Connection failed, retrying...", Toast.LENGTH_SHORT).show());
+                reconnectWithDelay();
             }
         });
     }
 
-    private void handleServerMessage(String message) {
-        if (message.equals("0000000")) {
-            // Heartbeat message
-            return;
+
+//    private void updateSensorUI(int position, int status, String sensorId, String description) {
+//        SensorEvent event = new SensorEvent(position, status, sensorId, description);
+//        sensorData.put(position, event);
+//        updateSensorUI(event);
+//    }
+
+    private void updateSensorUI(SensorEvent event) {
+        if (event.position < 1 || event.position > 5) return;
+
+        TextView view = sensorViews[event.position - 1];
+        view.setText(event.description + "    " + event.status);
+
+        switch (event.status) {
+            case STATUS_ALARM:
+                view.setBackgroundColor(Color.RED);
+                break;
+            case STATUS_ACK:
+                view.setBackgroundColor(Color.parseColor("#FFA500")); // Orange
+                break;
+            case STATUS_RESOLVED:
+                view.setBackgroundColor(Color.GREEN);
+                break;
+        }
+    }
+
+    private void updateSoundStatus() {
+        boolean anyAlarm = false;
+        for (SensorEvent e : sensorData.values()) {
+            if (e.status == STATUS_ALARM) {
+                anyAlarm = true;
+                break;
+            }
         }
 
-        int position = Character.getNumericValue(message.charAt(0));
-        int status = Character.getNumericValue(message.charAt(1));
-        String sensorId = message.substring(2, 6);
-        String description = message.substring(6);
-
-        SensorEvent event = sensorEvents.get(position);
-        if (event != null) {
-            event.update(status, sensorId, description);
-        }
-
-        boolean alarmActive = sensorEvents.values().stream().anyMatch(e -> e.status == 1);
-        if (alarmActive) {
-            if (!mediaPlayer.isPlaying()) {
-                mediaPlayer.setLooping(true);
-                mediaPlayer.start();
+        if (anyAlarm) {
+            if (alertStreamId == 0) {
+                alertStreamId = soundPool.play(alertSoundId, 1, 1, 1, -1, 1);
             }
         } else {
-            if (mediaPlayer.isPlaying()) {
-                mediaPlayer.stop();
-                try {
-                    mediaPlayer.prepare();
-                } catch (Exception e) {
-                    e.printStackTrace();
-                }
+            if (alertStreamId != 0) {
+                soundPool.stop(alertStreamId);
+                alertStreamId = 0;
             }
         }
     }
 
-    private void acknowledgeAlarm(int position) {
-        SensorEvent event = sensorEvents.get(position);
-        if (event != null && event.status == 1) {
-            String ackMessage = event.sensorId + Integer.toHexString(userId).toUpperCase();
-            webSocket.send(ackMessage);
+    private void sendAcknowledge(int sensorId, int userId) {
+        String ackMsg = "ACK" + sensorId + "-" + userId;
+        if (webSocket != null) {
+            webSocket.send(ackMsg);
+            Toast.makeText(this, "Acknowledged", Toast.LENGTH_SHORT).show();
         }
     }
 
-    private void startHeartbeat() {
-        heartbeatRunnable = new Runnable() {
+    private void reconnectWithDelay() {
+        handler.removeCallbacks(reconnectRunnable);
+        reconnectRunnable = () -> {
+            String ip = prefs.getString("server_ip", null);
+            if (ip != null) {
+                connectWebSocket(ip);
+            }
+        };
+        handler.postDelayed(reconnectRunnable, 5000); // retry after 5 seconds
+    }
+
+    private void startHeartbeatCheck() {
+        handler.postDelayed(new Runnable() {
             @Override
             public void run() {
-                webSocket.send("0000000");
-                handler.postDelayed(this, 60000);    }
-        };
-        handler.postDelayed(heartbeatRunnable, 60000);
-    }
-
-    private void stopHeartbeat() {
-        if (heartbeatRunnable != null) {
-            handler.removeCallbacks(heartbeatRunnable);
-        }
+                long now = System.currentTimeMillis();
+                if (now - lastMessageTime > 180000) {
+                    Log.d(TAG, "No heartbeat received for 3 minutes, reconnecting...");
+                    reconnectWithDelay();
+                }
+                handler.postDelayed(this, 60000);
+            }
+        }, 60000);
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
         if (webSocket != null) {
-            webSocket.close(1000, null);
+            webSocket.close(1000, "App closed");
         }
-        if (mediaPlayer != null) {
-            mediaPlayer.release();
+        if (soundPool != null) {
+            soundPool.release();
         }
-        stopHeartbeat();
     }
 
-    // Inner class to represent a sensor event
-    private class SensorEvent {
-        TextView view;
+    private void processMcResponse(String body) {
+        Log.d("RAW_RESPONSE", "Body: " + body);
+
+        String cleaned = body.replace("<br>", "\n").trim();
+        String[] lines = cleaned.split("(\r\n|\r|\n)");
+
+        for (String line : lines) {
+            Log.d("LINE", "Line: " + line);
+            if (line.length() < 6 || !Character.isDigit(line.charAt(0))) continue;
+
+            try {
+                int position = Character.getNumericValue(line.charAt(0)); // 1–5
+                int status = Character.getNumericValue(line.charAt(1));   // 1 = ALARM, 2 = ACK, 3 = RESOLVED
+                String sensorId = line.substring(2, 6);                   // 1234
+                String description = line.length() > 6 ? line.substring(6).trim() : "";
+                Log.d("PARSED", "Position=" + position + ", Status=" + status + ", ID=" + sensorId + ", Desc=" + description);
+                SensorEvent event = new SensorEvent(position, status, sensorId, description);
+                updateSensorUI(event);
+            } catch (Exception e) {
+                Log.e("Parse Error", "Line parse failed: " + line, e);
+            }
+        }
+    }
+
+    class SensorEvent {
+        int position;
         int status;
         String sensorId;
         String description;
 
-        SensorEvent(TextView view) {
-            this.view = view;
-        }
-
-        void update(int status, String sensorId, String description) {
+        SensorEvent(int position, int status, String sensorId, String description) {
+            this.position = position;
             this.status = status;
             this.sensorId = sensorId;
             this.description = description;
-            view.setText(description);
-            switch (status) {
-                case 1:
-                    view.setBackgroundColor(getResources().getColor(android.R.color.holo_red_dark));
-                    break;
-                case 2:
-                    view.setBackgroundColor(getResources().getColor(android.R.color.holo_orange_dark));
-                    break;
-                case 3:
-                    view.setBackgroundColor(getResources().getColor(android.R.color.holo_green_dark));
-                    break;
-            }
         }
     }
+
+
 }
-//        createWebSocketClient();
-//    }
-//        private void createWebSocketClient () {
-//            URI uri;
-//            try {
-//                // Connect to local host
-//                uri = new URI("ws://82.193.209.203/mc");
-//            } catch (URISyntaxException e) {
-//                e.printStackTrace();
-//                return;
-//            }
-//
-//            webSocketClient = new WebSocketClient(uri) {
-//                @Override
-//                public void onOpen() {
-//                    Log.i("WebSocket", "Session is starting");
-//                    webSocketClient.send("Hello World!");
-//                }
-//
-//                @Override
-//                public void onTextReceived(String s) {
-//                    Log.i("WebSocket", "Message received");
-//                    final String message = s;
-//                    runOnUiThread(new Runnable() {
-//                        @Override
-//                        public void run() {
-//                            try {
-//                                Log.i("WebSocket", message);
-//
-//                            } catch (Exception e) {
-//                                e.printStackTrace();
-//                            }
-//                        }
-//                    });
-//                }
-//
-//                @Override
-//                public void onBinaryReceived(byte[] data) {
-//                }
-//
-//                @Override
-//                public void onPingReceived(byte[] data) {
-//                }
-//
-//                @Override
-//                public void onPongReceived(byte[] data) {
-//                }
-//
-//                @Override
-//                public void onException(Exception e) {
-//                    System.out.println(e.getMessage());
-//                }
-//
-//                @Override
-//                public void onCloseReceived() {
-//                    Log.i("WebSocket", "Closed ");
-//                    System.out.println("onCloseReceived");
-//                }
-//            };
-//
-//            webSocketClient.setConnectTimeout(10000);
-//            webSocketClient.setReadTimeout(60000);
-//            webSocketClient.enableAutomaticReconnection(5000);
-//            webSocketClient.connect();
-//        }
-//    }
