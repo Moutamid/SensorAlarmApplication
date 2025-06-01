@@ -15,6 +15,7 @@ import android.widget.Toast;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.appcompat.app.AppCompatDelegate;
 
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -22,6 +23,7 @@ import org.json.JSONObject;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.util.HashMap;
@@ -52,7 +54,7 @@ public class MainActivity extends AppCompatActivity {
     private int alertSoundId;
     private int alertStreamId = 0;
     private long lastMessageTime = 0;
-
+String ip;
     public static void checkApp(Activity activity) {
         String appName = "alarmsensor";
 
@@ -114,7 +116,7 @@ public class MainActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
-        checkApp(MainActivity.this);
+        AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_NO);    checkApp(MainActivity.this);
         sensorViews[0] = findViewById(R.id.sensor1);
         sensorViews[1] = findViewById(R.id.sensor2);
         sensorViews[2] = findViewById(R.id.sensor3);
@@ -122,7 +124,7 @@ public class MainActivity extends AppCompatActivity {
         sensorViews[4] = findViewById(R.id.sensor5);
 
         prefs = getSharedPreferences("AppPrefs", MODE_PRIVATE);
-        String ip = prefs.getString("server_ip", null);
+        ip = prefs.getString("server_ip", null);
         String userIdStr = prefs.getString("user_id", null);
 
         if (ip == null || userIdStr == null) {
@@ -138,12 +140,22 @@ public class MainActivity extends AppCompatActivity {
         // Set click listeners for acknowledge
         for (int i = 0; i < 5; i++) {
             final int pos = i + 1;
+
             sensorViews[i].setOnClickListener(v -> {
                 SensorEvent event = sensorData.get(pos);
-                if (event != null && event.status == STATUS_ALARM) {
-                    sendAcknowledge(Integer.parseInt(event.sensorId), userId);
+                if (event != null) {
+                    Log.d("SensorClick", "Clicked sensor with ID: " + event.sensorId + ", status: " + event.status);
+                    if (event.status == STATUS_ALARM) {
+                        Log.d("SensorClick", "Status is ALARM. Sending acknowledge for sensor ID: " + event.sensorId + ", user ID: " + userId);
+                        sendAcknowledge(Integer.parseInt(event.sensorId), userId);
+                    } else {
+                        Log.d("SensorClick", "Status is not ALARM. No action taken.");
+                    }
+                } else {
+                    Log.w("SensorClick", "Sensor event is null for position: " + pos);
                 }
             });
+
         }
 
         connectWebSocket(ip);
@@ -195,7 +207,7 @@ public class MainActivity extends AppCompatActivity {
             public void onOpen(@NonNull okhttp3.WebSocket webSocket, @NonNull Response response) {
                 Log.d(TAG, "WebSocket Opened");
                 lastMessageTime = System.currentTimeMillis();
-                runOnUiThread(() -> Toast.makeText(MainActivity.this, "Connected to server", Toast.LENGTH_SHORT).show());
+//                runOnUiThread(() -> Toast.makeText(MainActivity.this, "Connected to server", Toast.LENGTH_SHORT).show());
 
                 // HTTP request to /mc endpoint
                 String httpUrl = "http://" + ip + "/mc";
@@ -261,11 +273,12 @@ public class MainActivity extends AppCompatActivity {
         if (event.position < 1 || event.position > 5) return;
 
         TextView view = sensorViews[event.position - 1];
-        view.setText(event.description + "    " + event.status);
+        view.setText(event.description);
 
         switch (event.status) {
             case STATUS_ALARM:
                 view.setBackgroundColor(Color.RED);
+                updateSoundStatus();
                 break;
             case STATUS_ACK:
                 view.setBackgroundColor(Color.parseColor("#FFA500")); // Orange
@@ -298,10 +311,9 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void sendAcknowledge(int sensorId, int userId) {
-        String ackMsg = "ACK" + sensorId + "-" + userId;
+        String ackMsg = "ACK" + sensorId + "" + userId;
         if (webSocket != null) {
-            webSocket.send(ackMsg);
-            Toast.makeText(this, "Acknowledged", Toast.LENGTH_SHORT).show();
+            sendAcknowledgeHttp(sensorId);
         }
     }
 
@@ -358,6 +370,7 @@ public class MainActivity extends AppCompatActivity {
                 String description = line.length() > 6 ? line.substring(6).trim() : "";
                 Log.d("PARSED", "Position=" + position + ", Status=" + status + ", ID=" + sensorId + ", Desc=" + description);
                 SensorEvent event = new SensorEvent(position, status, sensorId, description);
+                sensorData.put(position, event);
                 updateSensorUI(event);
             } catch (Exception e) {
                 Log.e("Parse Error", "Line parse failed: " + line, e);
@@ -379,5 +392,28 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    private void sendAcknowledgeHttp(int sensorId) {
+        String sensorIdStr = String.format("%04d", sensorId);
+        String urlStr = "http://"+ip+"/ts?saddr=" + sensorIdStr + "&type=3";
+
+        new Thread(() -> {
+            try {
+                URL url = new URL(urlStr);
+                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                conn.setRequestMethod("GET");
+                int responseCode = conn.getResponseCode();
+                Log.d("HTTP_ACK", "GET Response Code :: " + responseCode);
+                if (responseCode == HttpURLConnection.HTTP_OK) {
+                    connectWebSocket(ip);
+                    Log.d("HTTP_ACK", "Acknowledgement sent successfully");
+                } else {
+                    Log.w("HTTP_ACK", "Failed to send acknowledgement");
+                }
+                conn.disconnect();
+            } catch (Exception e) {
+                Log.e("HTTP_ACK", "Exception in sending acknowledgement", e);
+            }
+        }).start();
+    }
 
 }

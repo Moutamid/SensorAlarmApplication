@@ -2,6 +2,8 @@ package com.moutamid.sensoralarmapplication;
 
 import android.os.Bundle;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.appcompat.app.AppCompatDelegate;
+
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.widget.Button;
@@ -18,14 +20,12 @@ public class SetupActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_setup);
-
+        AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_NO);
         editIp = findViewById(R.id.editIp);
         editUserId = findViewById(R.id.editUserId);
         btnSave = findViewById(R.id.btnSave);
 
         prefs = getSharedPreferences("AppPrefs", MODE_PRIVATE);
-
-        // Prefill saved values if any
         editIp.setText(prefs.getString("server_ip", ""));
         editUserId.setText(prefs.getString("user_id", ""));
 
