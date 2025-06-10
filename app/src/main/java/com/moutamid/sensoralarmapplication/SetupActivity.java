@@ -6,6 +6,7 @@ import androidx.appcompat.app.AppCompatDelegate;
 
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.util.Log;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.Toast;
@@ -30,8 +31,8 @@ public class SetupActivity extends AppCompatActivity {
         editUserId.setText(prefs.getString("user_id", ""));
 
         btnSave.setOnClickListener(v -> {
-            String ip = editIp.getText().toString().trim();
-            String userId = editUserId.getText().toString().trim();
+            String ip = editIp.getText().toString();
+            String userId = editUserId.getText().toString();
 
             if (ip.isEmpty() || userId.isEmpty()) {
                 Toast.makeText(this, "Both fields are required", Toast.LENGTH_SHORT).show();
@@ -46,6 +47,8 @@ public class SetupActivity extends AppCompatActivity {
                 Toast.makeText(this, "User ID must be between 1 and 15", Toast.LENGTH_SHORT).show();
                 return;
             }
+
+            Log.d("ip_address", ip + "   address");
 
             prefs.edit()
                     .putString("server_ip", ip)
