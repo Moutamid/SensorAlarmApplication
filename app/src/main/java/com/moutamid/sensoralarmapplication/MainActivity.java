@@ -40,6 +40,8 @@ import okio.ByteString;
 public class MainActivity extends AppCompatActivity {
 
     private static final String TAG = "MainActivity";
+    private boolean acknowledgementSent = false;
+
     private static final int STATUS_ALARM = 0;
     private static final int STATUS_ACK = 1;
     private static final int STATUS_RESOLVED = 2;
@@ -164,6 +166,8 @@ public class MainActivity extends AppCompatActivity {
             public void onMessage(@NonNull okhttp3.WebSocket webSocket, @NonNull String text) {
                 lastMessageTime = System.currentTimeMillis();
                 Log.d(TAG, "Received: " + text);
+                 acknowledgementSent = false;
+
                 runOnUiThread(() -> processMcResponse(text));
 
             }
@@ -222,6 +226,17 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void updateSoundStatus() {
+        Log.d("SoundStatus", "Alarm suppressed due to successful acknowledgement.--------"+  acknowledgementSent);
+
+        if (acknowledgementSent) {
+            Log.d("SoundStatus", "Alarm suppressed due to successful acknowledgement.");
+            if (alertStreamId != 0) {
+                soundPool.stop(alertStreamId);
+                alertStreamId = 0;
+            }
+            return;
+        }
+
         boolean anyAlarm = false;
         for (SensorEvent e : sensorData.values()) {
             Log.d("SoundStatus", "Sensor ID: " + e.sensorId + ", Status: " + e.status);
@@ -289,7 +304,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void processMcResponse(String body) {
-        Log.d("RAW_RESPONSE", "Body: " + body);
+        Log.d("RAW_RESPONSE", acknowledgementSent+ "Body: " + body);
         String cleaned = body.replace("<br>", "\n").trim();
         String[] lines = cleaned.split("(\r\n|\r|\n)");
         for (String line : lines) {
@@ -313,8 +328,7 @@ public class MainActivity extends AppCompatActivity {
     private void sendAcknowledgeHttp(int sensorId) {
         String sensorIdStr = String.format("%04d", sensorId);
         String urlStr = "http://" + ip + "/ts?saddr=" + sensorIdStr + "&type=2";
-        Log.d("IP_ADDRESS", ip+"   sendACK_address");
-
+        Log.d("IP_ADDRESS", ip + "   sendACK_address");
 
         new Thread(() -> {
             try {
@@ -323,9 +337,32 @@ public class MainActivity extends AppCompatActivity {
                 conn.setRequestMethod("GET");
                 int responseCode = conn.getResponseCode();
                 Log.d("HTTP_ACK", "GET Response Code :: " + responseCode);
+
                 if (responseCode == HttpURLConnection.HTTP_OK) {
-                    connectWebSocket(ip);
-                    Log.d("HTTP_ACK", "Acknowledgement sent successfully");
+                    String httpUrl = "http://" + ip + "/mc";
+                    Log.d("IP_ADDRESS", httpUrl + "   httpUrl");
+                    Request httpRequest = new Request.Builder().url(httpUrl).build();
+
+                    client.newCall(httpRequest).enqueue(new Callback() {
+                        @Override
+                        public void onFailure(@NonNull Call call, @NonNull IOException e) {
+                            Log.e("HTTP /mc", "Failed to hit /mc: " + e.getMessage());
+                        }
+
+                        @Override
+                        public void onResponse(@NonNull Call call, @NonNull Response response) throws IOException {
+                            if (response.isSuccessful()) {
+                                String body = response.body().string();
+                                acknowledgementSent = true;
+
+                                processMcResponse(body);
+
+                                Log.d("HTTP_ACK", "Acknowledgement sent successfully - alarm will be suppressed");
+                            } else {
+                                Log.e("HTTP /mc", "Server error: " + response.code());
+                            }
+                        }
+                    });
                 } else {
                     Log.w("HTTP_ACK", "Failed to send acknowledgement");
                 }
